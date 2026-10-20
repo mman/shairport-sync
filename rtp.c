@@ -1306,6 +1306,44 @@ static int64_t nanoseconds_to_frames(int64_t nanoseconds, uint32_t rate) {
   return (whole_seconds * rate) + ((remaining_nanoseconds * rate) / 1000000000);
 }
 
+// TEST SCAFFOLDING -- not for merging.
+//
+// The frame distance between an audio block and the anchor only reaches 2^31 after 12 h 25 min
+// of continuous playback at 48,000 frames per second, and the int64 limit of the frames-to-
+// nanoseconds scaling only after about 53 hours, which makes both impractical to test against a
+// real sender. Setting SPS_TEST_FRAME_DISTANCE_OFFSET to a number of frames moves the anchor
+// back by that many frames in both of its coordinates. The pair stays equivalent, so every
+// converted time is unchanged and audio plays normally, but the internal frame distance starts
+// at the offset instead of at zero. With the offset set a little below a limit, that limit is
+// reached within minutes.
+//
+// Note that this only shifts the receiver's arithmetic. The sender's own timeline is untouched,
+// so this isolates the receiver's behaviour from the sender's.
+
+static int64_t test_frame_distance_offset(void) {
+  static int64_t offset = -1;
+  if (offset < 0) {
+    const char *setting = getenv("SPS_TEST_FRAME_DISTANCE_OFFSET");
+    int64_t value = (setting != NULL) ? strtoll(setting, NULL, 10) : 0;
+    if (value < 0)
+      value = 0;
+    offset = value; // benign if two threads race here -- they compute the same value
+    if (offset != 0)
+      debug(1, "TEST: frame distance offset is %" PRId64 " frames.", offset);
+  }
+  return offset;
+}
+
+// move the anchor back by the test offset, keeping the (frame, time) pair equivalent
+static void apply_test_frame_distance_offset(uint64_t *anchor_rtptime_extended,
+                                             uint64_t *anchor_local_time, uint32_t rate) {
+  int64_t offset = test_frame_distance_offset();
+  if (offset != 0) {
+    *anchor_rtptime_extended = *anchor_rtptime_extended - offset;
+    *anchor_local_time = *anchor_local_time - frames_to_nanoseconds(offset, rate);
+  }
+}
+
 void note_ptp_rtp_timestamp(rtsp_conn_info *conn, uint32_t timestamp) {
   // call this with the timestamp of each audio block as it is passed to the player
   int rc = pthread_mutex_lock(&conn->reference_time_mutex);
@@ -1578,6 +1616,7 @@ int frame_to_ptp_local_time(uint32_t timestamp, uint64_t *time, rtsp_conn_info *
   if ((rate != 0) &&
       (get_ptp_anchor_local_time_info_extended(conn, &anchor_rtptime_extended, &anchor_local_time,
                                                &extension_reference) == clock_ok)) {
+    apply_test_frame_distance_offset(&anchor_rtptime_extended, &anchor_local_time, rate);
     int64_t frame_difference =
         extend_rtp_timestamp(timestamp, extension_reference) - anchor_rtptime_extended;
     int64_t time_difference = frames_to_nanoseconds(frame_difference, rate);
@@ -1597,6 +1636,7 @@ int local_ptp_time_to_frame(uint64_t time, uint32_t *frame, rtsp_conn_info *conn
   uint32_t rate = conn->input_rate; // it can be changed by the player thread, so take a copy
   if ((rate != 0) && (get_ptp_anchor_local_time_info_extended(
                           conn, &anchor_rtptime_extended, &anchor_local_time, NULL) == clock_ok)) {
+    apply_test_frame_distance_offset(&anchor_rtptime_extended, &anchor_local_time, rate);
     int64_t time_difference = time - anchor_local_time;
     int64_t frame_difference = nanoseconds_to_frames(time_difference, rate);
     *frame = (uint32_t)(anchor_rtptime_extended + frame_difference);
